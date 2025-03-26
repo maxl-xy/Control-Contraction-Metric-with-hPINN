@@ -138,7 +138,10 @@ K = 1024
 def loss_pos_matrix_random_sampling(A):
     # A: bs x d x d
     # z: K x d
-    z = torch.randn(K, A.size(-1)).cuda()
+    if args.use_cuda:
+        z = torch.randn(K, A.size(-1)).cuda()
+    else:
+        z = torch.randn(K, A.size(-1))
     z = z / z.norm(dim=1, keepdim=True)
     zTAz = (z.matmul(A) * z.view(1,K,-1)).sum(dim=2).view(-1)
     negative_index = zTAz.detach().cpu().numpy() < 0
@@ -150,7 +153,7 @@ def loss_pos_matrix_random_sampling(A):
 
 def loss_pos_matrix_eigen_values(A):
     # A: bs x d x d
-    eigv = torch.symeig(A, eigenvectors=True)[0].view(-1)
+    eigv = torch.linalg.eigh(A, UPLO='U')[0].view(-1)
     negative_index = eigv.detach().cpu().numpy() < 0
     negative_eigv = eigv[negative_index]
     return negative_eigv.norm()
@@ -200,9 +203,14 @@ def forward(x, xref, uref, _lambda, verbose=False, acc=False, detach=False):
     loss += 1. * sum([1.*(C2**2).reshape(bs,-1).sum(dim=1).mean() for C2 in C2s])
 
     if verbose:
-        print(torch.symeig(Contraction)[0].min(dim=1)[0].mean(), torch.symeig(Contraction)[0].max(dim=1)[0].mean(), torch.symeig(Contraction)[0].mean())
+        eigenvalues = torch.linalg.eigh(Contraction, UPLO='U')[0]
+        print(eigenvalues.min(dim=1)[0].mean(), eigenvalues.max(dim=1)[0].mean(), eigenvalues.mean())
+
     if acc:
-        return loss, ((torch.symeig(Contraction)[0]>=0).sum(dim=1)==0).cpu().detach().numpy(), ((torch.symeig(C1_LHS_1)[0]>=0).sum(dim=1)==0).cpu().detach().numpy(), sum([1.*(C2**2).reshape(bs,-1).sum(dim=1).mean() for C2 in C2s]).item()
+        return loss, \
+    ((torch.linalg.eigh(Contraction, UPLO='U')[0] >= 0).sum(dim=1) == 0).cpu().detach().numpy(), \
+    ((torch.linalg.eigh(C1_LHS_1, UPLO='U')[0] >= 0).sum(dim=1) == 0).cpu().detach().numpy(), \
+    sum([1. * (C2**2).reshape(bs, -1).sum(dim=1).mean() for C2 in C2s]).item()
     else:
         return loss, None, None, None
 
