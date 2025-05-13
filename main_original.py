@@ -1,7 +1,7 @@
 import torch
 from torch.autograd import grad
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
+
 import importlib
 import numpy as np
 import time
@@ -16,7 +16,6 @@ import argparse
 
 np.random.seed(1024)
 
-# Hyperparameters
 parser = argparse.ArgumentParser(description="")
 parser.add_argument('--task', type=str,
                         default='CAR', help='Name of the model.')
@@ -215,49 +214,6 @@ def forward(x, xref, uref, _lambda, verbose=False, acc=False, detach=False):
     else:
         return loss, None, None, None
 
-# For computing diagnostics
-def compute_diagnostics(x, xref, uref, _lambda):
-    """
-    Returns two tensors of shape (bs,):
-      - min_eig_C1: the smallest eigenvalue of C1 (should be < 0)
-      - max_norm_C2: the largest Frobenius-norm of any C2_j (should be ~ 0)
-    """
-    # Re-compute exactly what forward() does for C1 and C2
-    W = W_func(x)
-    f = f_func(x)
-    B = B_func(x)
-
-    # Jacobians
-    DfDx = Jacobian(f, x)  # bs×n×n
-    DBDx = torch.stack([Jacobian(B[:,:,i].unsqueeze(-1), x)
-                        for i in range(num_dim_control)], dim=-1)  # bs×n×n×m
-    Bbot = Bbot_func(x)    # bs×n×(n−m)
-
-    # C1_inner = −∂_fW + Df·W + W·Dfᵀ + 2λW
-    C1_inner = (
-        -weighted_gradients(W, f,       x)
-        + DfDx @ W
-        + W @ DfDx.transpose(1,2)
-        + 2*_lambda*W
-    )
-    C1 = Bbot.transpose(1,2) @ C1_inner @ Bbot  # bs×(n−m)×(n−m)
-    eigs_C1 = torch.linalg.eigvalsh(C1)
-    min_eig_C1 = eigs_C1.min(dim=1)[0]           # bs
-
-    # For Eq(3), build each C2_j and take its Frobenius norm
-    norms_C2 = []
-    for j in range(num_dim_control):
-        C2_inner = (
-            weighted_gradients(W, B[:,:,j].unsqueeze(-1), x)
-            - (DBDx[:,:,: ,j] @ W + W @ DBDx[:,:,: ,j].transpose(1,2))
-        )
-        C2 = Bbot.transpose(1,2) @ C2_inner @ Bbot
-        # flatten last two dims and norm over them:
-        norms_C2.append(torch.norm(C2.reshape(C2.shape[0], -1), dim=1))
-    max_norm_C2 = torch.stack(norms_C2, dim=1).max(dim=1)[0]  # bs
-
-    return min_eig_C1.detach().cpu().numpy(), max_norm_C2.detach().cpu().numpy()
-
 optimizer = torch.optim.Adam(list(model_W.parameters()) + list(model_Wbot.parameters()) + list(model_u_w1.parameters()) + list(model_u_w2.parameters()), lr=args.learning_rate)
 
 def trainval(X, bs=args.bs, train=True, _lambda=args._lambda, acc=False, detach=False): # trainval a set of x
@@ -320,9 +276,6 @@ def adjust_learning_rate(optimizer, epoch):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-history_min_eig = []
-history_max_c2 = []
-
 for epoch in range(args.epochs):
     adjust_learning_rate(optimizer, epoch)
     loss, _, _, _ = trainval(X_tr, train=True, _lambda=args._lambda, acc=False, detach=True if epoch < args.lr_step else False)
@@ -330,54 +283,9 @@ for epoch in range(args.epochs):
     loss, p1, p2, l3 = trainval(X_te, train=False, _lambda=0., acc=True, detach=False)
     print("Epoch %d: Testing loss/p1/p2/l3: "%epoch, loss, p1, p2, l3)
 
-    # --- new: collect diagnostics on *one* batch (or all batches) of test data ---
-    min_eigs_list = []
-    max_c2s_list  = []
-
-    for b in range(len(X_te)//args.bs):
-        batch = X_te[b*args.bs:(b+1)*args.bs]
-        x   = torch.stack([torch.from_numpy(t[0]).float() for t in batch]).requires_grad_(True)
-        xref= torch.stack([torch.from_numpy(t[1]).float() for t in batch])
-        uref= torch.stack([torch.from_numpy(t[2]).float() for t in batch])
-        if args.use_cuda:
-            x, xref, uref = x.cuda(), xref.cuda(), uref.cuda()
-
-        me, mc2 = compute_diagnostics(x, xref, uref, _lambda=args._lambda)
-        min_eigs_list.append(me)
-        max_c2s_list.append(mc2)
-
-    min_eigs = np.concatenate(min_eigs_list)
-    max_c2s  = np.concatenate(max_c2s_list)
-
-    # store them per epoch
-    history_min_eig.append(min_eigs.min())   # worst‐case
-    history_max_c2.append(max_c2s.max())     # worst‐case
-
     if p1+p2 >= best_acc:
         best_acc = p1 + p2
         filename = args.log+'/model_best.pth.tar'
         filename_controller = args.log+'/controller_best.pth.tar'
         torch.save({'args':args, 'precs':(loss, p1, p2), 'model_W': model_W.state_dict(), 'model_Wbot': model_Wbot.state_dict(), 'model_u_w1': model_u_w1.state_dict(), 'model_u_w2': model_u_w2.state_dict()}, filename)
         torch.save(u_func, filename_controller)
-
-
-# --- plot the diagnostics ---
-epochs = np.arange(len(history_min_eig))
-
-plt.figure()
-plt.plot(epochs, history_min_eig, marker='o')
-plt.axhline(0, color='k', linestyle='--')
-plt.title('Worst‐case $\min\lambda(C_1)$ per Epoch (Eq. 2)')
-plt.xlabel('Epoch')
-plt.ylabel('Min Eigenvalue')
-plt.grid(True)
-
-plt.figure()
-plt.plot(epochs, history_max_c2, marker='o')
-plt.axhline(0, color='k', linestyle='--')
-plt.title('Worst‐case $\max_j\|C_{2,j}\|$ per Epoch (Eq. 3)')
-plt.xlabel('Epoch')
-plt.ylabel('Max Norm')
-plt.grid(True)
-
-plt.show()
