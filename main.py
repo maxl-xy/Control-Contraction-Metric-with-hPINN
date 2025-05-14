@@ -242,7 +242,7 @@ def compute_diagnostics(x, xref, uref, _lambda):
     )
     C1 = Bbot.transpose(1,2) @ C1_inner @ Bbot  # bs×(n−m)×(n−m)
     eigs_C1 = torch.linalg.eigvalsh(C1)
-    min_eig_C1 = eigs_C1.min(dim=1)[0]           # bs
+    max_eig_C1 = eigs_C1.max(dim=1)[0]           # bs
 
     # For Eq(3), build each C2_j and take its Frobenius norm
     norms_C2 = []
@@ -256,7 +256,7 @@ def compute_diagnostics(x, xref, uref, _lambda):
         norms_C2.append(torch.norm(C2.reshape(C2.shape[0], -1), dim=1))
     max_norm_C2 = torch.stack(norms_C2, dim=1).max(dim=1)[0]  # bs
 
-    return min_eig_C1.detach().cpu().numpy(), max_norm_C2.detach().cpu().numpy()
+    return max_eig_C1.detach().cpu().numpy(), max_norm_C2.detach().cpu().numpy()
 
 optimizer = torch.optim.Adam(list(model_W.parameters()) + list(model_Wbot.parameters()) + list(model_u_w1.parameters()) + list(model_u_w2.parameters()), lr=args.learning_rate)
 
@@ -320,7 +320,7 @@ def adjust_learning_rate(optimizer, epoch):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-history_min_eig = []
+history_max_eig = []
 history_max_c2 = []
 
 for epoch in range(args.epochs):
@@ -331,7 +331,7 @@ for epoch in range(args.epochs):
     print("Epoch %d: Testing loss/p1/p2/l3: "%epoch, loss, p1, p2, l3)
 
     # --- new: collect diagnostics on *one* batch (or all batches) of test data ---
-    min_eigs_list = []
+    max_eigs_list = []
     max_c2s_list  = []
 
     for b in range(len(X_te)//args.bs):
@@ -343,14 +343,14 @@ for epoch in range(args.epochs):
             x, xref, uref = x.cuda(), xref.cuda(), uref.cuda()
 
         me, mc2 = compute_diagnostics(x, xref, uref, _lambda=args._lambda)
-        min_eigs_list.append(me)
+        max_eigs_list.append(me)
         max_c2s_list.append(mc2)
 
-    min_eigs = np.concatenate(min_eigs_list)
+    max_eigs = np.concatenate(max_eigs_list)
     max_c2s  = np.concatenate(max_c2s_list)
 
     # store them per epoch
-    history_min_eig.append(min_eigs.min())   # worst‐case
+    history_max_eig.append(max_eigs.min())   # worst‐case
     history_max_c2.append(max_c2s.max())     # worst‐case
 
     if p1+p2 >= best_acc:
@@ -362,14 +362,14 @@ for epoch in range(args.epochs):
 
 
 # --- plot the diagnostics ---
-epochs = np.arange(len(history_min_eig))
+epochs = np.arange(len(history_max_eig))
 
 plt.figure()
-plt.plot(epochs, history_min_eig, marker='o')
+plt.plot(epochs, history_max_eig, marker='o')
 plt.axhline(0, color='k', linestyle='--')
-plt.title('Worst‐case $\min\lambda(C_1)$ per Epoch (Eq. 2)')
+plt.title('Worst‐case $\max\lambda(C_1)$ per Epoch (Eq. 2)')
 plt.xlabel('Epoch')
-plt.ylabel('Min Eigenvalue')
+plt.ylabel('Max Eigenvalue')
 plt.grid(True)
 
 plt.figure()

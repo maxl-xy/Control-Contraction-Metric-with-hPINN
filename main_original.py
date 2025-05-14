@@ -16,6 +16,7 @@ import argparse
 
 np.random.seed(1024)
 
+# Hyperparameters
 parser = argparse.ArgumentParser(description="")
 parser.add_argument('--task', type=str,
                         default='CAR', help='Name of the model.')
