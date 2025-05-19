@@ -218,33 +218,38 @@ def forward(x, xref, uref, _lambda, verbose=False, acc=False, detach=False):
 # For computing diagnostics
 def compute_diagnostics(x, xref, uref, _lambda):
     """
-    Returns two tensors of shape (bs,):
-      - min_eig_C1: the smallest eigenvalue of C1 (should be < 0)
-      - max_norm_C2: the largest Frobenius-norm of any C2_j (should be ~ 0)
+    Returns three np.arrays of shape (bs,):
+      - max_eig_C1:    the largest eigenvalue of C1 (should be < 0)
+      - max_norm_C2:   the largest Frobenius‐norm of any C2_j (should be ~ 0)
+      - max_eig_Contr: the largest eigenvalue of the contraction matrix (Eq.4, should be < 0)
     """
-    # Re-compute exactly what forward() does for C1 and C2
-    W = W_func(x)
-    f = f_func(x)
-    B = B_func(x)
+    # pull in everything
+    W = W_func(x)                    # bs×n×n
+    M = torch.inverse(W)             # bs×n×n
+    f = f_func(x)                    # bs×n×1
+    B = B_func(x)                    # bs×n×m
 
     # Jacobians
-    DfDx = Jacobian(f, x)  # bs×n×n
-    DBDx = torch.stack([Jacobian(B[:,:,i].unsqueeze(-1), x)
-                        for i in range(num_dim_control)], dim=-1)  # bs×n×n×m
-    Bbot = Bbot_func(x)    # bs×n×(n−m)
+    DfDx = Jacobian(f, x)            # bs×n×n
+    DBDx = torch.stack([
+        Jacobian(B[:,:,j].unsqueeze(-1), x)
+        for j in range(num_dim_control)
+    ], dim=-1)                       # bs×n×n×m
 
-    # C1_inner = −∂_fW + Df·W + W·Dfᵀ + 2λW
+    Bbot = Bbot_func(x)              # bs×n×(n−m)
+
+    # --- Condition 2 (C1) ---
     C1_inner = (
-        -weighted_gradients(W, f,       x)
+        -weighted_gradients(W, f, x)
         + DfDx @ W
         + W @ DfDx.transpose(1,2)
-        + 2*_lambda*W
-    )
-    C1 = Bbot.transpose(1,2) @ C1_inner @ Bbot  # bs×(n−m)×(n−m)
-    eigs_C1 = torch.linalg.eigvalsh(C1)
-    max_eig_C1 = eigs_C1.max(dim=1)[0]           # bs
+        + 2*_lambda * W
+    )                                 # bs×n×n
+    C1 = Bbot.transpose(1,2) @ C1_inner @ Bbot
+    eigs_C1 = torch.linalg.eigvalsh(C1)      # bs×(n−m)
+    max_eig_C1 = eigs_C1.max(dim=1)[0]       # bs
 
-    # For Eq(3), build each C2_j and take its Frobenius norm
+    # --- Condition 3 (C2) ---
     norms_C2 = []
     for j in range(num_dim_control):
         C2_inner = (
@@ -252,11 +257,43 @@ def compute_diagnostics(x, xref, uref, _lambda):
             - (DBDx[:,:,: ,j] @ W + W @ DBDx[:,:,: ,j].transpose(1,2))
         )
         C2 = Bbot.transpose(1,2) @ C2_inner @ Bbot
-        # flatten last two dims and norm over them:
         norms_C2.append(torch.norm(C2.reshape(C2.shape[0], -1), dim=1))
     max_norm_C2 = torch.stack(norms_C2, dim=1).max(dim=1)[0]  # bs
 
-    return max_eig_C1.detach().cpu().numpy(), max_norm_C2.detach().cpu().numpy()
+    # --- Condition 4 (Contraction on M) ---
+    # 1) u(x)
+    u = u_func(x, x - xref, uref)           # bs×m×1
+    dot_x = f + B.matmul(u)                 # bs×n×1
+
+    # 2) dot_M = ∂ₓM · dot_x
+    dot_M = weighted_gradients(M, dot_x, x)
+
+    # 3) A = DfDx + Σ u_j ∂ₓb_j
+    A = DfDx.clone()
+    for j in range(num_dim_control):
+        A = A + u[:,j,0].view(-1,1,1) * DBDx[:,:,:,j]
+
+    # 4) K = ∂ₓu, so BK = B·K
+    K = Jacobian(u, x)                     # bs×m×n
+    BK = B.matmul(K)                       # bs×n×n
+
+    # 5) build contraction matrix
+    Contr = (
+        dot_M
+        + (A + BK).transpose(1,2) @ M
+        + M @ (A + BK)
+        + 2*_lambda * M
+    )                                       # bs×n×n
+    eigs_Contr = torch.linalg.eigvalsh(Contr)  # bs×n
+    max_eig_Contr = eigs_Contr.max(dim=1)[0]   # bs
+
+    # move everything to cpu & numpy
+    return (
+        max_eig_C1.detach().cpu().numpy(),
+        max_norm_C2.detach().cpu().numpy(),
+        max_eig_Contr.detach().cpu().numpy()
+    )
+
 
 optimizer = torch.optim.Adam(list(model_W.parameters()) + list(model_Wbot.parameters()) + list(model_u_w1.parameters()) + list(model_u_w2.parameters()), lr=args.learning_rate)
 
@@ -320,38 +357,45 @@ def adjust_learning_rate(optimizer, epoch):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-history_max_eig = []
-history_max_c2 = []
+# just before the epoch loop, define histories
+history_C1    = []
+history_C2    = []
+history_Contr = []
 
 for epoch in range(args.epochs):
     adjust_learning_rate(optimizer, epoch)
-    loss, _, _, _ = trainval(X_tr, train=True, _lambda=args._lambda, acc=False, detach=True if epoch < args.lr_step else False)
+    # --- training & basic test as before ---
+    loss, _, _, _ = trainval(X_tr, train=True,
+                             _lambda=args._lambda,
+                             acc=False, detach=(epoch<args.lr_step))
     print("Training loss: ", loss)
-    loss, p1, p2, l3 = trainval(X_te, train=False, _lambda=0., acc=True, detach=False)
-    print("Epoch %d: Testing loss/p1/p2/l3: "%epoch, loss, p1, p2, l3)
+    loss, p1, p2, l3 = trainval(X_te, train=False,
+                                _lambda=0., acc=True, detach=False)
+    print(f"Epoch {epoch}: Testing loss/p1/p2/l3:", loss, p1, p2, l3)
 
-    # --- new: collect diagnostics on *one* batch (or all batches) of test data ---
-    max_eigs_list = []
-    max_c2s_list  = []
-
+    # --- new diagnostics collection for Eq(2), Eq(3), and Eq(4) ---
+    all_C1, all_C2, all_Contr = [], [], []
     for b in range(len(X_te)//args.bs):
         batch = X_te[b*args.bs:(b+1)*args.bs]
-        x   = torch.stack([torch.from_numpy(t[0]).float() for t in batch]).requires_grad_(True)
-        xref= torch.stack([torch.from_numpy(t[1]).float() for t in batch])
-        uref= torch.stack([torch.from_numpy(t[2]).float() for t in batch])
+        x_batch   = torch.stack([torch.from_numpy(t[0]).float() for t in batch]).requires_grad_(True)
+        xref_batch= torch.stack([torch.from_numpy(t[1]).float() for t in batch])
+        uref_batch= torch.stack([torch.from_numpy(t[2]).float() for t in batch])
         if args.use_cuda:
-            x, xref, uref = x.cuda(), xref.cuda(), uref.cuda()
+            x_batch, xref_batch, uref_batch = x_batch.cuda(), xref_batch.cuda(), uref_batch.cuda()
 
-        me, mc2 = compute_diagnostics(x, xref, uref, _lambda=args._lambda)
-        max_eigs_list.append(me)
-        max_c2s_list.append(mc2)
+        c1_vals, c2_vals, contr_vals = compute_diagnostics(x_batch, xref_batch, uref_batch, _lambda=args._lambda)
+        all_C1.append(c1_vals)
+        all_C2.append(c2_vals)
+        all_Contr.append(contr_vals)
 
-    max_eigs = np.concatenate(max_eigs_list)
-    max_c2s  = np.concatenate(max_c2s_list)
+    all_C1    = np.concatenate(all_C1)
+    all_C2    = np.concatenate(all_C2)
+    all_Contr = np.concatenate(all_Contr)
 
-    # store them per epoch
-    history_max_eig.append(max_eigs.min())   # worst‐case
-    history_max_c2.append(max_c2s.max())     # worst‐case
+    # record worst‐cases
+    history_C1.append(all_C1.min())     # smallest max‐eig(C1)
+    history_C2.append(all_C2.max())     # largest norm(C2)
+    history_Contr.append(all_Contr.min())# smallest max‐eig(Contraction)
 
     if p1+p2 >= best_acc:
         best_acc = p1 + p2
@@ -362,22 +406,24 @@ for epoch in range(args.epochs):
 
 
 # --- plot the diagnostics ---
-epochs = np.arange(len(history_max_eig))
+epochs = np.arange(len(history_C1))
 
 plt.figure()
-plt.plot(epochs, history_max_eig, marker='o')
-plt.axhline(0, color='k', linestyle='--')
-plt.title('Worst‐case $\max\lambda(C_1)$ per Epoch (Eq. 2)')
-plt.xlabel('Epoch')
-plt.ylabel('Max Eigenvalue')
-plt.grid(True)
+plt.plot(epochs, history_C1, marker='o')
+plt.axhline(0, linestyle='--', color='k')
+plt.title(r'Worst‐case $\max\lambda(C_1)$ per Epoch (Eq. 2)')
+plt.xlabel('Epoch'); plt.ylabel('Max Eig(C₁)'); plt.grid(True)
 
 plt.figure()
-plt.plot(epochs, history_max_c2, marker='o')
-plt.axhline(0, color='k', linestyle='--')
-plt.title('Worst‐case $\max_j\|C_{2,j}\|$ per Epoch (Eq. 3)')
-plt.xlabel('Epoch')
-plt.ylabel('Max Norm')
-plt.grid(True)
+plt.plot(epochs, history_C2, marker='o')
+plt.axhline(0, linestyle='--', color='k')
+plt.title(r'Worst‐case $\max_j\|C_{2,j}\|$ per Epoch (Eq. 3)')
+plt.xlabel('Epoch'); plt.ylabel('Max ‖C₂‖'); plt.grid(True)
+
+plt.figure()
+plt.plot(epochs, history_Contr, marker='o')
+plt.axhline(0, linestyle='--', color='k')
+plt.title(r'Worst‐case $\max\lambda\!\left(\dot M + M(A+BK) + 2\lambda M\right)$ per Epoch (Eq. 4)')
+plt.xlabel('Epoch'); plt.ylabel('Max Eig(Contraction)'); plt.grid(True)
 
 plt.show()
