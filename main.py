@@ -402,7 +402,7 @@ for epoch in range(args.epochs):
         filename = args.log+'/model_best.pth.tar'
         filename_controller = args.log+'/controller_best.pth.tar'
         torch.save({'args':args, 'precs':(loss, p1, p2), 'model_W': model_W.state_dict(), 'model_Wbot': model_Wbot.state_dict(), 'model_u_w1': model_u_w1.state_dict(), 'model_u_w2': model_u_w2.state_dict()}, filename)
-        torch.save(u_func, filename_controller)
+        #torch.save(u_func, filename_controller)
 
 
 # --- plot the diagnostics ---
