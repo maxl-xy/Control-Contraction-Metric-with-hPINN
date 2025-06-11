@@ -199,16 +199,9 @@ def forward(x, xref, uref, _lambda, verbose=False, acc=False, detach=False):
     loss += loss_pos_matrix_random_sampling(-C1_LHS_1 - epsilon * torch.eye(C1_LHS_1.shape[-1]).unsqueeze(0).type(x.type()))
     loss += loss_pos_matrix_random_sampling(args.w_ub * torch.eye(W.shape[-1]).unsqueeze(0).type(x.type()) - W)
     loss += 1. * sum([1.*(C2**2).reshape(bs,-1).sum(dim=1).mean() for C2 in C2s])
-
-    #hPINN trial run
-    #loss = 0
-    #loss += loss_pos_matrix_random_sampling(-Contraction - epsilon * torch.eye(Contraction.shape[-1]).unsqueeze(0).type(x.type()))
-    #loss += loss_pos_matrix_random_sampling(-C1_LHS_1 - epsilon * torch.eye(C1_LHS_1.shape[-1]).unsqueeze(0).type(x.type()))
-    #loss += loss_pos_matrix_random_sampling(args.w_ub * torch.eye(W.shape[-1]).unsqueeze(0).type(x.type()) - W)
-    #loss += 1. * sum([1.*(C2**2).reshape(bs,-1).sum(dim=1).mean() for C2 in C2s])
-    #maxval, _ = torch.max(u - torch.tensor(U_MAX, device=u.device), 0)
-    #minval, _ = torch.min(u - torch.tensor(U_MIN, device=u.device), 0)
-    #loss += (maxval**2.0 + minval**2.0).squeeze()
+    maxval, _ = torch.max(u - torch.tensor(U_MAX, device=u.device), 0)
+    minval, _ = torch.min(u - torch.tensor(U_MIN, device=u.device), 0)
+    loss += (maxval**2.0 + minval**2.0).squeeze()
     #loss += torch.norm(x - xref, p=2, dim=(1,2)).mean() # convergence loss
     
 
